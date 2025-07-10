@@ -1,0 +1,173 @@
+// Automated Greenhose
+#include <WiFi.h>
+#include <FirebaseESP32.h>
+#include <DHT.h>
+
+// Firebase project details
+#define FIREBASE_HOST "greenhouse-43661-default-rtdb.asia-southeast1.firebasedatabase.app"
+#define FIREBASE_AUTH "7UpOgjHBHxhMdjL8olpSfnYBg0VL1WaS7Z1nAwUL"
+
+// WiFi credentials
+#define WIFI_SSID "Hotspot"
+#define WIFI_PASSWORD "12345678"
+
+// Pin Definitions
+#define DHTPIN 15           // DHT11 connected to D15
+#define DHTTYPE DHT11       // DHT11 sensor type
+#define LDR_PIN 2           // Digital LDR connected to D2
+#define SOIL_MOISTURE_PIN 34 // Soil moisture sensor connected to GPIO34 (ADC pin)
+#define RELAY_FILAMENT 13   // Heating filament relay connected to GPIO13
+#define RELAY_LED 12        // LED strip relay connected to GPIO12
+#define RELAY_PUMP 27       // Water pump relay connected to GPIO27
+#define RELAY_BUZZER 33     // Buzzer relay connected to GPIO33
+#define RELAY_FAN 32        // Fan relay connected to GPIO32
+#define TRIG_PIN 5          // Ultrasonic sensor trigger pin connected to GPIO5
+#define ECHO_PIN 18         // Ultrasonic sensor echo pin connected to GPIO18
+
+// Firebase configuration
+FirebaseData firebaseData;
+FirebaseJson Json;
+FirebaseConfig config;
+FirebaseAuth auth;
+
+// Initialize DHT sensor
+DHT dht(DHTPIN, DHTTYPE);
+
+// Thresholds
+float tempThresholdLow = 20.0;    // Low temperature threshold for heating
+float tempThresholdHigh = 35.0;   // High temperature threshold for fan
+int soilThreshold = 600;          // Soil moisture threshold (adjust after calibration)
+float humidityThresholdHigh = 80.0;  // High humidity threshold for fan
+float humidityThresholdLow = 40.0;   // Low humidity threshold for LED blinking
+long motionDistanceThreshold = 50;   // Distance in cm to trigger motion detection (within 50cm)
+
+// State variables for fan and LED
+bool fanOn = false;
+bool ledOn = false;
+
+void setup() {
+  Serial.begin(115200);
+
+  // Connect to WiFi
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  Serial.print("Connecting to WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    Serial.print(".");
+    delay(300);
+  }
+  Serial.println("\nConnected!");
+
+  // Firebase configuration
+  config.host = FIREBASE_HOST;
+  config.signer.tokens.legacy_token = FIREBASE_AUTH;
+
+  // Initialize Firebase
+  Firebase.begin(&config, &auth);
+  Firebase.reconnectWiFi(true);
+
+  // Initialize DHT sensor
+  dht.begin();
+
+  // Set up pins
+  pinMode(LDR_PIN, INPUT_PULLUP);  
+  pinMode(SOIL_MOISTURE_PIN, INPUT);
+  pinMode(RELAY_FILAMENT, OUTPUT);
+  pinMode(RELAY_LED, OUTPUT);
+  pinMode(RELAY_PUMP, OUTPUT);
+  pinMode(RELAY_BUZZER, OUTPUT);
+  pinMode(RELAY_FAN, OUTPUT);
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+}
+
+void loop() {
+  // Read sensors
+  float temperature = dht.readTemperature();
+  float humidity = dht.readHumidity();
+  int ldrValue = digitalRead(LDR_PIN); 
+  int soilValue = analogRead(SOIL_MOISTURE_PIN);
+
+  // Motion detection using HC-SR04
+  long duration, distance;
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+  duration = pulseIn(ECHO_PIN, HIGH);
+  distance = duration * 0.034 / 2; // Calculate the distance in cm
+
+  // Update Firebase with sensor values
+  Json.set("Temperature", temperature);
+  Json.set("Humidity", humidity);
+  Json.set("SoilMoisture", soilValue);
+  Json.set("LDR", ldrValue);
+  Json.set("MotionDistance", distance);
+
+  Firebase.updateNode(firebaseData, "/SensorData", Json);
+
+  // Control Water Pump and Buzzer for Soil Moisture
+  if (soilValue < soilThreshold) {
+    digitalWrite(RELAY_PUMP, LOW); 
+    Firebase.setBool(firebaseData, "/Actuators/WaterPump", true);
+
+    for (int i = 0; i < 2; i++) {
+      digitalWrite(RELAY_BUZZER, LOW);
+      delay(500);
+      digitalWrite(RELAY_BUZZER, HIGH);
+      delay(500);
+    }
+  } else {
+    digitalWrite(RELAY_PUMP, HIGH);
+    Firebase.setBool(firebaseData, "/Actuators/WaterPump", false);
+  }
+
+  // Control Buzzer and LED for Motion Detection using HC-SR04
+  if (distance < motionDistanceThreshold) {
+    for (int i = 0; i < 3; i++) {
+      digitalWrite(RELAY_BUZZER, LOW);
+      delay(500);
+      digitalWrite(RELAY_BUZZER, HIGH);
+      delay(500);
+    }
+    digitalWrite(RELAY_LED, LOW);
+    Firebase.setBool(firebaseData, "/Actuators/LED", true);
+  } else {
+    digitalWrite(RELAY_LED, HIGH);
+    Firebase.setBool(firebaseData, "/Actuators/LED", false);
+  }
+
+  // Control LED for Humidity
+  if (humidity < humidityThresholdLow) {
+    if (!ledOn) {
+      digitalWrite(RELAY_LED, LOW);
+      Firebase.setBool(firebaseData, "/Actuators/LED", true);
+      ledOn = true;
+    }
+  } else if (humidity > humidityThresholdHigh) {
+    if (ledOn) {
+      digitalWrite(RELAY_LED, HIGH);
+      Firebase.setBool(firebaseData, "/Actuators/LED", false);
+      ledOn = false;
+    }
+  }
+
+  // Control Fan for Temperature
+  if (temperature > tempThresholdHigh) {
+    if (!fanOn) {
+      digitalWrite(RELAY_FAN, LOW);
+      Firebase.setBool(firebaseData, "/Actuators/Fan", true);
+      fanOn = true;
+    }
+  } else if (temperature < tempThresholdLow) {
+    if (fanOn) {
+      digitalWrite(RELAY_FAN, HIGH);
+      Firebase.setBool(firebaseData, "/Actuators/Fan", false);
+      fanOn = false;
+    }
+  }
+
+  // Delay for stability
+  Serial.println("=========================");
+  delay(2000);
+}
